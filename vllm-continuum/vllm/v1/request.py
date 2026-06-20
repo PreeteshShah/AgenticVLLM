@@ -43,6 +43,8 @@ class Request:
         last_func_call: Optional[str] = None,
         is_last_step: Optional[bool] = None,
         this_func_call: Optional[str] = None,
+        binding_type: Optional[str] = None,
+        rg_key: Optional[str] = None,
     ) -> None:
     # TODO (Hanchen) need to input job_id, last_func_call, is_last_step, this_func_call from the API request
         self.job_id = job_id
@@ -51,6 +53,11 @@ class Request:
         self.last_func_call = last_func_call
         self.is_last_step = is_last_step
         self.this_func_call = this_func_call
+        # v2 resource-group metadata (set from extra_args by the replay client).
+        # binding_type bottleneck class: PREFILL_BOUND / DECODE_BOUND / IO_BOUND
+        # / MIXED / LLM_ONLY. rg_key is the full v2 resource-group key string.
+        self.binding_type = binding_type
+        self.rg_key = rg_key
         
         
         self.request_id = request_id  
@@ -142,6 +149,8 @@ class Request:
         last_func_call = None
         is_last_step = None
         this_func_call = None
+        binding_type = None
+        rg_key = None
         if request.sampling_params is not None and \
                 request.sampling_params.extra_args is not None:
             extra_args = request.sampling_params.extra_args
@@ -149,6 +158,8 @@ class Request:
             last_func_call = extra_args.get("last_func_call")
             is_last_step = extra_args.get("is_last_step")
             this_func_call = extra_args.get("this_func_call")
+            binding_type = extra_args.get("binding_type")
+            rg_key = extra_args.get("rg_key")
 
         return cls(
             job_id=job_id,
@@ -171,6 +182,8 @@ class Request:
             last_func_call=last_func_call,
             is_last_step=is_last_step,
             this_func_call=this_func_call,
+            binding_type=binding_type,
+            rg_key=rg_key,
         )
 
     def append_output_token_ids(

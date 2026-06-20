@@ -1,0 +1,14 @@
+metric,job_baseline,binding_rg,delta_pct
+System E2E latency (s),147.06,146.29,-0.52
+Throughput (jobs/s),0.18,0.18,0.0
+Throughput (tok/s),740.22,737.91,-0.31
+JCT mean (s),102.42,101.71,-0.69
+JCT p50 (s),107.61,105.77,-1.71
+JCT p95 (s),133.36,132.73,-0.47
+JCT p99 (s),142.82,142.13,-0.48
+Req latency p50 (s),3.05,3.07,0.66
+Req latency p95 (s),6.22,6.22,0.0
+Req latency p99 (s),6.45,6.41,-0.62
+GPU util mean (%),91.01,90.89,-0.13
+GPU util p95 (%),94.8,95.0,0.21
+GPU util max (%),95.25,95.5,0.26

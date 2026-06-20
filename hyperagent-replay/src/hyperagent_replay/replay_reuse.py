@@ -17,6 +17,7 @@ from hyperagent_replay.replay import (
     DEFAULT_CHARS_PER_TOKEN_ESTIMATE,
     DEFAULT_CONTEXT_SAFETY_MARGIN,
     DEFAULT_MIN_REFERENCE_CHARS,
+    estimate_text_tokens,
     ENGINE_MODE_CHOICES,
     ENGINE_MODE_CONTINUUM,
     ENGINE_MODE_STOCK,
@@ -38,6 +39,7 @@ from hyperagent_replay.replay import (
     tool_delay_for_turn,
     wait_for_server,
 )
+from hyperagent_replay import binding
 from hyperagent_replay.resource_groups import (
     build_exact_repeat_key,
     build_resource_group,
@@ -73,6 +75,44 @@ def default_reuse_output_path(input_path: Path) -> Path:
             base = name[:-len(suffix)]
             return input_path.with_name(f"{base}.reuse.replay.json")
     return input_path.with_name(f"{name}.reuse.replay.json")
+
+
+def compute_turn_binding_and_rg(
+    turn: dict[str, Any],
+    subgoal: str,
+    estimated_prompt_tokens: int | None,
+    slo_class: str,
+    delay_policy: str,
+    constant_delay: float,
+    chars_per_token_estimate: float,
+) -> tuple[str, str]:
+    """Compute (binding_type, rg_key) for a turn *before* it is sent.
+
+    Uses request-time-known quantities only: the estimated prompt size
+    (prefill proxy), the recorded turn's output length (decode proxy), and the
+    turn's tool delay (io). This is the v2 resource-group key the continuum
+    scheduler groups on. Mirrors `binding.classify_binding` exactly.
+    """
+    action = turn.get("action") or None
+    tool = action.get("tool_name") if action else None
+    decode_tokens_est = estimate_text_tokens(
+        turn.get("content", ""), chars_per_token_estimate)
+    io_seconds = tool_delay_for_turn(turn, delay_policy, constant_delay)
+    binding_type = binding.classify_binding(
+        new_prefill_tokens=estimated_prompt_tokens or 0,
+        decode_tokens=decode_tokens_est,
+        io_seconds=io_seconds,
+        has_action=action is not None,
+    )
+    workload = binding.workload_type(turn.get("agent"), tool)
+    rg_key = "|".join([
+        workload,
+        binding_type,
+        binding.dag_layer(turn.get("agent")),
+        binding.subgoal_prefix(subgoal),
+        slo_class,
+    ])
+    return binding_type, rg_key
 
 
 def build_cache_hit_observation(turn: dict[str, Any],
@@ -510,10 +550,21 @@ def replay_trace_with_reuse(
 
         if cache_entry is None:
             if engine_mode == ENGINE_MODE_CONTINUUM:
+                turn_binding_type, turn_rg_key = compute_turn_binding_and_rg(
+                    turn=turn,
+                    subgoal=subgoal,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    slo_class=slo_class,
+                    delay_policy=delay_policy,
+                    constant_delay=constant_delay,
+                    chars_per_token_estimate=chars_per_token_estimate,
+                )
                 continuum_extra_body = build_continuum_extra_body(
                     instance_id=continuum_job_id,
                     turn=turn,
                     is_last_step=(turn_index_in_trace == last_vllm_turn_index),
+                    binding_type=turn_binding_type,
+                    rg_key=turn_rg_key,
                 )
             request_arrival_time = time.time()
             while True:

@@ -1,0 +1,15 @@
+parameter,value
+model,meta-llama/Llama-3.1-70B-Instruct
+hardware,4x NVIDIA H100 80GB (TP=4)
+vllm_version,0.10.2 (continuum fork)
+scheduling_policy,continuum
+rg_modes_compared,job (baseline) vs binding (CONTINUUM_RG_MODE)
+traces,27 MAST/HyperAgent SWE-bench (1 corrupt skipped)
+max_turns_per_job,30
+max_completion_tokens,256
+arrival_rate_jobs_per_s,3.0
+max_model_len,32768
+gpu_memory_utilization,0.9
+jobs_ok,27 / 27
+jobs_failed,1 (corrupt sphinx-8435 trace)
+requests_executed,702 / 702

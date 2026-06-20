@@ -50,12 +50,19 @@ def build_continuum_extra_body(
     instance_id: str,
     turn: dict[str, Any],
     is_last_step: bool,
+    binding_type: str | None = None,
+    rg_key: str | None = None,
 ) -> dict[str, Any]:
     """Build the `extra_body` kwargs to tag a request for vllm-continuum.
 
     `last_func_call` is intentionally not sent: vllm-continuum's
     `ToolCallEstimator.request_arrives` asserts it is None on the first
     turn of a job and otherwise overwrites it from its internal history.
+
+    `binding_type` / `rg_key` carry the v2 resource-group metadata so the
+    continuum scheduler can do binding-grouped admission (CONTINUUM_RG_MODE=
+    binding). They are computed at request-build time (before output exists)
+    from the prompt size and the recorded turn's output length.
     """
     body: dict[str, Any] = {
         "job_id": instance_id,
@@ -64,6 +71,10 @@ def build_continuum_extra_body(
     tool_signature = continuum_tool_signature(turn)
     if tool_signature and tool_signature != "LLM_ONLY":
         body["this_func_call"] = tool_signature
+    if binding_type is not None:
+        body["binding_type"] = binding_type
+    if rg_key is not None:
+        body["rg_key"] = rg_key
     return body
 
 

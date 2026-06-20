@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any
 
+from hyperagent_replay import binding
 from hyperagent_replay.replay import estimate_text_tokens
 from hyperagent_replay.trace import parse_events
 
@@ -111,6 +112,9 @@ def build_resource_group(
     response_text: str = "",
     chars_per_token_estimate: float = 3.0,
     subgoal: str = "",
+    rg_version: str = "legacy",
+    new_prefill_tokens: int | None = None,
+    io_seconds: float = 0.0,
 ) -> dict[str, str]:
     prompt_count = prompt_tokens
     if prompt_count is None:
@@ -125,6 +129,27 @@ def build_resource_group(
                                                 chars_per_token_estimate)
     if completion_count is None:
         completion_count = 0
+
+    if rg_version == "v2":
+        action = turn.get("action") or None
+        tool = action.get("tool_name") if action else None
+        prefill_count = (new_prefill_tokens
+                         if new_prefill_tokens is not None else prompt_count)
+        binding_type = binding.classify_binding(
+            new_prefill_tokens=prefill_count,
+            decode_tokens=completion_count,
+            io_seconds=io_seconds,
+            has_action=action is not None,
+        )
+        group = {
+            "workload_type": binding.workload_type(turn.get("agent"), tool),
+            "binding_type": binding_type,
+            "dag_layer_bucket": binding.dag_layer(turn.get("agent")),
+            "subgoal_prefix": binding.subgoal_prefix(subgoal),
+            "slo_class": slo_class,
+        }
+        group["key"] = json.dumps(group, sort_keys=True, separators=(",", ":"))
+        return group
 
     group = {
         "slo_class": slo_class,

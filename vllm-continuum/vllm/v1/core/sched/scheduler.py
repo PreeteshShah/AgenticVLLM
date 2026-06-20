@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import itertools
+import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from typing import Any, Optional, Union, Tuple
 
@@ -126,6 +127,12 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # CONTINUUM_RG_MODE selects the continuum admission policy:
+        #   "job"     -> original job-level FCFS + pinning (default, unchanged)
+        #   "binding" -> additionally coalesce same-binding_type requests so
+        #                prefill-bound and decode-bound work batch separately.
+        self.continuum_rg_mode = os.environ.get("CONTINUUM_RG_MODE", "job").lower()
 
         # Initialize ToolCallEstimator with tokenizer config
         self.tool_call_estimator = ToolCallEstimator(
@@ -260,7 +267,25 @@ class Scheduler(SchedulerInterface):
             if req.job_id == request.job_id:
                 return True
         return False
-    
+
+    def _preferred_binding(self) -> Optional[str]:
+        """Binding_type that should be preferred for the next admission.
+
+        Returns the binding_type dominating the current running batch so that
+        same-binding work coalesces. Returns None (no preference) when RG mode
+        is not "binding" or no running request carries a binding_type, which
+        makes the continuum queue behave exactly as the job-only baseline.
+        """
+        if self.continuum_rg_mode != "binding":
+            return None
+        counts = Counter(
+            r.binding_type for r in self.running
+            if getattr(r, "binding_type", None))
+        if not counts:
+            return None
+        return counts.most_common(1)[0][0]
+
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -467,7 +492,7 @@ class Scheduler(SchedulerInterface):
                     request = self.waiting.peek_request()
                 elif self.policy == SchedulingPolicy.CONTINUUM:
                     #The current implementation is basically giving priority to jobs with less prefill tokens.
-                    request = self.waiting.peek_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                    request = self.waiting.peek_request(self.pinned_requests, self.kv_cache_manager, self.connector, self._preferred_binding())
                 else:
                     raise ValueError(f"Invalid policy: {self.policy}")
 
@@ -480,8 +505,8 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
-                        if self.policy == SchedulingPolicy.CONTINUUM: 
-                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                        if self.policy == SchedulingPolicy.CONTINUUM:
+                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector, self._preferred_binding())
                         else:
                             self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
@@ -494,8 +519,8 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        if self.policy == SchedulingPolicy.CONTINUUM: 
-                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                        if self.policy == SchedulingPolicy.CONTINUUM:
+                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector, self._preferred_binding())
                         else:
                             self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)

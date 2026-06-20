@@ -1,0 +1,247 @@
+================================================================================
+PLAN & RESULTS — Prefill/Decode Resource-Group (RG) Scheduling for Agentic Traces
+Llama-3.1-70B-Instruct on vLLM-continuum, MAST/HyperAgent traces
+Run date: 2026-06-16
+================================================================================
+
+--------------------------------------------------------------------------------
+1. GOAL / HYPOTHESIS
+--------------------------------------------------------------------------------
+Question: Can a "prefill-decode heavy" resource-group (RG) scheduling option
+improve END-TO-END latency for agentic LLM workloads?
+
+Idea: instead of grouping requests by (sub_agent, tool_signature, slo_class),
+group them by a richer v2 RG key whose key axis is BINDING_TYPE — what resource
+the turn bottlenecks:
+  PREFILL_BOUND  (compute-bound: big prompt, short output)
+  DECODE_BOUND   (memory-bandwidth-bound: small prompt, long output)
+  IO_BOUND       (off-GPU tool wait dominates)
+  MIXED / LLM_ONLY
+The scheduler then forms same-binding groups so prefill-heavy and decode-heavy
+work batch together instead of interleaving, aiming to cut interference and
+lower latency / job completion time (JCT).
+
+Test method: replay recorded HyperAgent trajectories (the MAST trace set) as
+concurrent jobs against a live vLLM-continuum server, measuring system E2E
+latency, JCT, and GPU utilization, with the RG grouping ON vs OFF.
+
+--------------------------------------------------------------------------------
+1b. WHAT "JOB" vs "BINDING" MEANS (the two things compared)
+--------------------------------------------------------------------------------
+Both runs use the SAME continuum scheduler and the SAME everything (model,
+hardware, traces, arrival rate, turn/token caps). The ONLY difference is the
+environment variable CONTINUUM_RG_MODE, which changes how the scheduler picks
+the next waiting request to admit:
+
+  job  (baseline)  CONTINUUM_RG_MODE=job
+       The original continuum behavior. Requests are admitted by job-level FCFS
+       (oldest job first) plus KV-cache pinning. The scheduler does NOT look at
+       a request's prefill/decode character. This is the control.
+
+  binding  (the RG approach being tested)  CONTINUUM_RG_MODE=binding
+       Same FCFS + pinning, PLUS resource-group grouping by binding_type: among
+       the waiting requests, the scheduler prefers ones whose binding_type
+       (PREFILL_BOUND / DECODE_BOUND / IO_BOUND / ...) matches the binding that
+       currently dominates the running batch. The intent is to batch prefill-
+       heavy work with prefill-heavy work and decode-heavy with decode-heavy,
+       reducing interference. This is the experimental arm.
+
+So "job vs binding" = "scheduler ignores prefill/decode character (baseline)"
+vs "scheduler groups by prefill/decode character (RG approach)". If the RG idea
+helps, the "binding" column should show lower latency/JCT and/or higher GPU util
+than "job". In this run it did not (deltas within noise).
+
+--------------------------------------------------------------------------------
+2. REPO UNDERSTANDING
+--------------------------------------------------------------------------------
+AgenticVLLM/
+  vllm-continuum/      vLLM 0.10.2 fork with a "continuum" scheduling policy.
+                       A job (one agent trajectory) = one job_id. The continuum
+                       scheduler does job-level FCFS and PINS a job's KV cache
+                       for a short window after each turn so the next turn of the
+                       same job reuses the warm prefix (the latency win).
+  hyperagent-replay/   Standalone pipeline that parses raw HyperAgent log
+                       trajectories into structured turns and REPLAYS them against
+                       a vllm serve endpoint, recording per-turn latency, JCT-style
+                       scheduler timestamps, SLO reports, and reuse analysis.
+  trajectories/        27 usable MAST/HyperAgent SWE-bench traces (1 corrupt:
+                       sphinx-doc__sphinx-8435, empty JSON, skipped everywhere).
+  MAST/                Failure-taxonomy paper/assets (not extra traces).
+
+Key pre-existing fact: the RG previously lived only in hyperagent-replay for
+classification/reporting; it did NOT drive vLLM's scheduler. The continuum
+scheduler grouped purely by job_id.
+
+--------------------------------------------------------------------------------
+3. WHAT WE BUILT
+--------------------------------------------------------------------------------
+A. Binding classifier (single source of truth), GPU-free:
+   hyperagent-replay/src/hyperagent_replay/binding.py
+     classify_binding(new_prefill_tokens, decode_tokens, io_seconds, has_action)
+     -> PREFILL_BOUND / DECODE_BOUND / IO_BOUND / MIXED / LLM_ONLY  (cost-share>50%)
+     plus workload_type(), dag_layer(), subgoal_prefix().
+   Used both offline (estimated tokens) and live (real usage tokens).
+
+B. Offline split preview (Python 3.8, no deps):
+   hyperagent-replay/tools/binding_split_preview.py
+   Showed the prefill/decode split across the 27 traces BEFORE spending GPU.
+   Finding: under realistic 70B cost ratios the workload is overwhelmingly
+   DECODE_BOUND (~1% PREFILL_BOUND at a 50x prefill:decode speed ratio); the
+   prefill-bound share only grows if that ratio is small.
+
+C. Scheduler change (the mechanism), in vllm-continuum, SELECTABLE via env
+   CONTINUUM_RG_MODE = job (default, unchanged) | binding :
+     - vllm/v1/request.py: Request now carries binding_type + rg_key from
+       sampling_params.extra_args.
+     - vllm/v1/core/sched/request_queue.py: ContinuumRequestQueue.peek/pop take
+       an optional preferred_binding; the job-FCFS fallback prefers waiting
+       requests whose binding_type matches the running batch. None => identical
+       to baseline.
+     - vllm/v1/core/sched/scheduler.py: _preferred_binding() returns the binding
+       dominating the running batch (only when CONTINUUM_RG_MODE=binding).
+     KV pinning is unchanged.
+
+D. Replay sends the binding label at request-build time (before output exists),
+   computed from estimated prompt tokens (prefill) + recorded turn output length
+   (decode) + tool delay (io):
+     hyperagent-replay/src/hyperagent_replay/replay_reuse.py (compute_turn_binding_and_rg)
+     hyperagent-replay/src/hyperagent_replay/replay.py (build_continuum_extra_body)
+
+E. Concurrent load driver (the missing piece — the stock batch replay is
+   sequential, so the scheduler never had to choose between jobs):
+     hyperagent-replay/tools/concurrent_replay.py
+   Launches traces as concurrent jobs at a Poisson arrival rate, samples GPU
+   utilization via nvidia-smi, and reports system E2E latency (makespan),
+   throughput, JCT percentiles, and per-request latency percentiles.
+
+F. Offline v2 RG wiring (selectable, default legacy):
+     resource_groups.build_resource_group(rg_version="v2")
+     derive_slos_and_resource_groups.py --rg-version v2
+
+--------------------------------------------------------------------------------
+4. EXPERIMENT SETUP (RunPod)
+--------------------------------------------------------------------------------
+Hardware : 4x NVIDIA H100 80GB (TP=4), RunPod on-demand pod.
+Image    : runpod/pytorch 2.4.0 py3.11 cuda12.4.1-devel.
+Model    : meta-llama/Llama-3.1-70B-Instruct (bf16, ~140GB weights).
+Serving  : vllm serve --scheduling-policy continuum --max-model-len 32768
+           --gpu-memory-utilization 0.90, run twice:
+             CONTINUUM_RG_MODE=job      (baseline)
+             CONTINUUM_RG_MODE=binding  (RG approach)
+Workload : 27 traces as concurrent jobs, arrival rate 3.0 jobs/s,
+           capped at 30 turns/job and 256 completion tokens (to fit budget).
+Driver   : tools/concurrent_replay.py, same command for both modes.
+Counts   : 27/27 jobs ok (1 corrupt trace skipped), 702 vLLM requests per mode.
+
+--------------------------------------------------------------------------------
+5. ISSUES HIT & FIXES (for reproducibility)
+--------------------------------------------------------------------------------
+- Editable install of the fork failed: .git was stripped, so setuptools_scm and
+  vLLM's precompiled-wheel logic couldn't resolve a version (fell back to a
+  mismatched nightly). FIX: detected base = vLLM 0.10.2 from deps (torch 2.8.0,
+  xformers 0.0.32.post1); pinned the matching stock 0.10.2 wheel as
+  VLLM_PRECOMPILED_WHEEL_LOCATION and set SETUPTOOLS_SCM_PRETEND_VERSION=0.10.2.
+- Tokenizer crash: transformers 5.12.1 (pulled by a loose >= pin) dropped
+  all_special_tokens_extended. FIX: pin transformers==4.55.2.
+- API 500 on every request: starlette 1.3.1 / fastapi 0.137 / prom-instr 8.0.0
+  broke the Prometheus middleware (route.path). FIX: pin starlette==0.47.2,
+  fastapi==0.116.1, prometheus-fastapi-instrumentator==7.1.0.
+- Orphaned GPU processes between modes: vLLM spawns VLLM::EngineCore / Worker_TP
+  procs (uppercase) that survived naive kills and held the port + GPU. FIX:
+  rewrote run_exp.sh teardown to kill the VLLM:: tree and wait for GPU release
+  before launching the next mode.
+
+--------------------------------------------------------------------------------
+6. RESULTS  (see summary.csv and plots/)
+--------------------------------------------------------------------------------
+metric                       job (baseline)   binding (RG)   delta
+System E2E latency (s)            147.06          146.29      -0.5%
+Throughput (jobs/s)                0.18            0.18       +0.5%
+Throughput (tok/s)               740.22          737.91      -0.3%
+JCT mean (s)                     102.42          101.71      -0.7%
+JCT p50 (s)                      107.61          105.77      -1.7%
+JCT p95 (s)                      133.36          132.73      -0.5%
+JCT p99 (s)                      142.82          142.13      -0.5%
+Req latency p95 (s)                6.22            6.22        0.0%
+GPU util mean (%)                 91.0            90.9        -0.1%
+
+VERDICT: NO MEASURABLE IMPROVEMENT. Every delta is within +/-1.7%, i.e.
+run-to-run noise. Binding-grouped RG scheduling did not improve end-to-end
+latency, JCT, or GPU utilization on this workload/config.
+
+--------------------------------------------------------------------------------
+7. WHY (interpretation)
+--------------------------------------------------------------------------------
+1. The GPU was already saturated (91% mean util). At saturation JCT is
+   throughput-bound; reordering admission cannot reclaim idle time that does
+   not exist.
+2. The workload is dominated by a single binding class (consistent with the
+   offline preview). With little prefill/decode diversity, _preferred_binding
+   mostly returns one class and the queue behaves like plain job-FCFS.
+3. The mechanism is weaker than the concept: it biases WHICH waiting request is
+   admitted next, but vLLM keeps chunked-prefill co-batching ON, so prefill and
+   decode still mix WITHIN each scheduler step. True "dedicated prefill steps vs
+   decode steps" would require disabling that mixing and phasing the batches.
+
+This is a clean negative result: the harness, scheduler hook, metrics, and
+selectable flag all work end to end; the hypothesis simply did not pay off in
+this configuration.
+
+--------------------------------------------------------------------------------
+8. LIMITATIONS
+--------------------------------------------------------------------------------
+- One config only (30 turns, 256 completion tokens, arrival 3.0, 32k ctx).
+- Replay caps turns/tokens for budget; not full-length trajectories.
+- binding_type at serve time uses estimated prompt tokens (full prompt) as the
+  prefill proxy, not real cached/new-prefill tokens.
+- 70B already saturated 4xH100; effects may differ on smaller models / more GPUs.
+
+--------------------------------------------------------------------------------
+9. NEXT STEPS TO ACTUALLY PRESSURE-TEST THE IDEA
+--------------------------------------------------------------------------------
+- Run at MODERATE load (e.g. --arrival-rate 0.5) where the GPU is not pegged —
+  that is where batch composition can matter.
+- Increase decode (--max-completion-tokens 1024+) to force a real prefill/decode
+  mix so there are two populations to separate.
+- Implement true PD phasing: disable chunked-prefill mixing so binding groups
+  run in separate scheduler steps (the faithful version of the hypothesis).
+- Sweep arrival rate (0.5 / 1.0 / 2.0 / 3.0) and plot latency-vs-load curves for
+  both modes.
+
+--------------------------------------------------------------------------------
+FILES IN THIS RESULTS FOLDER
+--------------------------------------------------------------------------------
+summary.csv         metric, job_baseline, binding_rg, delta_pct
+run_config.csv      experiment configuration + job/request counts
+make_results.py     regenerates the CSVs and plots from the captured numbers
+plan.txt            this file
+
+PLOTS (in plots/) — each shows two bars per metric: blue = job (baseline),
+orange = binding (RG). Closer/overlapping bars mean the RG mode changed nothing.
+
+  delta_overview.png
+      THE HEADLINE CHART. One horizontal bar per metric showing the percent
+      change of binding relative to job (negative = binding better). A shaded
+      gray band marks the +/-2% "noise" zone. Every bar sits inside that band,
+      which is the whole conclusion at a glance: RG grouping had no real effect.
+
+  jct_comparison.png
+      Job Completion Time (per-trajectory end-to-end time) at mean/p50/p95/p99,
+      job vs binding. This is the primary user-facing latency metric. Bars are
+      effectively equal (largest gap is p50 at -1.7%).
+
+  system_e2e_latency.png
+      System end-to-end latency = makespan = wall-clock time to drain ALL 27
+      concurrent jobs (the "system" latency, vs per-job JCT). job 147.1s vs
+      binding 146.3s -> -0.5%, i.e. unchanged.
+
+  request_latency.png
+      Per-request (per-turn) latency at p50/p95/p99 across all 702 requests.
+      Measures individual vLLM call latency rather than whole-job time. Nearly
+      identical between modes (p95 = 6.22s in both).
+
+  gpu_utilization.png
+      GPU SM utilization (mean/p95/max), sampled live via nvidia-smi during each
+      run. Both modes ~91% mean -> the GPU was already saturated in both, which
+      is a key reason scheduling order could not help.
+================================================================================

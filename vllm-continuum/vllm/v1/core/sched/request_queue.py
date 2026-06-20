@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
-from typing import Tuple
+from typing import Optional, Tuple
 
 from vllm.v1.request import Request
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -231,14 +231,20 @@ class ContinuumRequestQueue(deque[Request], RequestQueue):
             self.job_id_first_entry_time[request.job_id] = request.arrival_time
         self.append(request)
 
-    def pop_request(self, pinned_requests: list[Tuple[Request, float]], kv_cache_manager: KVCacheManager, connector: KVConnectorBase_V1) -> Request:
+    def pop_request(self, pinned_requests: list[Tuple[Request, float]], kv_cache_manager: KVCacheManager, connector: KVConnectorBase_V1, preferred_binding: Optional[str] = None) -> Request:
         """Pop a request from the queue according to continuum policy."""
-        request = self.peek_request(pinned_requests, kv_cache_manager, connector)
+        request = self.peek_request(pinned_requests, kv_cache_manager, connector, preferred_binding)
         self.remove_request(request)
         return request
 
     # NOTE (Hanchen): priority is pinned request -> job_id level FCFS
-    def peek_request(self, pinned_requests: list[Tuple[Request, float]], kv_cache_manager: KVCacheManager, connector: KVConnectorBase_V1) -> Request:
+    # When preferred_binding is set (CONTINUUM_RG_MODE=binding), the job-FCFS
+    # fallback is restricted to requests whose binding_type matches the binding
+    # currently dominating the running batch, so prefill-bound and decode-bound
+    # work coalesces into separate batches instead of interleaving. Pinning
+    # (KV reuse) is unchanged and always wins. preferred_binding=None reproduces
+    # the original job-only behavior exactly.
+    def peek_request(self, pinned_requests: list[Tuple[Request, float]], kv_cache_manager: KVCacheManager, connector: KVConnectorBase_V1, preferred_binding: Optional[str] = None) -> Request:
         if not self:
             raise IndexError("peek from an empty queue")
         # Extract just the requests from pinned_requests tuples
@@ -253,24 +259,34 @@ class ContinuumRequestQueue(deque[Request], RequestQueue):
                 if job_entry_time < earliest_entry_time:
                     earliest_entry_time = job_entry_time
                     earliest_request = request
-        
+
         if earliest_request is not None:
             return earliest_request
-        
-        # Otherwise, use job_id level FCFS: find the request whose job_id has the earliest first entry time
-        if self:
-            earliest_request = None
-            earliest_entry_time = float('inf')
-            
-            for request in self:
+
+        # Binding-grouped admission: among waiting requests, prefer those whose
+        # binding_type matches the running batch's dominant binding. Falls back
+        # to all requests if none match (or if preferred_binding is None).
+        def earliest_by_job_fcfs(candidates) -> Optional[Request]:
+            best = None
+            best_entry_time = float('inf')
+            for request in candidates:
                 job_entry_time = self.job_id_first_entry_time.get(request.job_id, request.arrival_time)
-                if job_entry_time < earliest_entry_time:
-                    earliest_entry_time = job_entry_time
-                    earliest_request = request
-            
-            return earliest_request
-        else:
-            raise IndexError("peek from an empty queue")
+                if job_entry_time < best_entry_time:
+                    best_entry_time = job_entry_time
+                    best = request
+            return best
+
+        if preferred_binding is not None:
+            same_binding = [r for r in self if r.binding_type == preferred_binding]
+            chosen = earliest_by_job_fcfs(same_binding)
+            if chosen is not None:
+                return chosen
+
+        # Otherwise, use job_id level FCFS: find the request whose job_id has the earliest first entry time
+        chosen = earliest_by_job_fcfs(self)
+        if chosen is not None:
+            return chosen
+        raise IndexError("peek from an empty queue")
 
   #  The blow implementation prioritize pineed request 
     # def peek_request(self, pinned_requests: list[Tuple[Request, float]]) -> Request:

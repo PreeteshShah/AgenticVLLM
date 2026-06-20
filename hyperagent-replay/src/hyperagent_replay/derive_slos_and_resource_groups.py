@@ -300,11 +300,40 @@ def estimate_cost(
     return cost
 
 
-def stage_rg_key(stage: Stage, slo_class: str) -> Tuple[str, Tuple[str, ...], str]:
+def stage_rg_key(stage: Stage, slo_class: str, rg_version: str = "legacy") -> Tuple[Any, Any, str]:
     """
-    Resource group key requested: grouping by sub-agent, refined by tool calls inside sub-agent.
-    RG = (sub_agent, tool_signature, slo_class)
+    Resource group key.
+
+    legacy: RG = (sub_agent, tool_signature, slo_class)
+    v2:     RG = (workload_type, binding_type, slo_class)
+
+    NOTE: the v2 binding here is an OFFLINE estimate. This script does not
+    reconstruct per-turn prompts, so new-prefill tokens are unmodeled (treated
+    as 0) and binding is decode/io-only -- it will under-report PREFILL_BOUND.
+    The faithful prefill/decode split comes from tools/binding_split_preview.py
+    (context-delta estimate) and from the live replay (real vLLM usage tokens).
+    The 3-arity is preserved so the rest of the report plumbing is unchanged.
     """
+    if rg_version == "v2":
+        from hyperagent_replay import binding
+        primary_tool = None
+        if stage.tool_counts:
+            primary_tool = max(
+                (t for t in stage.tool_counts if t != "__default__"),
+                key=lambda t: stage.tool_counts[t],
+                default=None,
+            )
+        io_seconds = sum(
+            cnt * DEFAULT_TOOL_LAT.get(t, DEFAULT_TOOL_LAT["__default__"])
+            for t, cnt in stage.tool_counts.items())
+        binding_type = binding.classify_binding(
+            new_prefill_tokens=0,
+            decode_tokens=stage.text_tokens,
+            io_seconds=io_seconds,
+            has_action=bool(stage.tool_counts),
+        )
+        workload = binding.workload_type(stage.sub_agent, primary_tool)
+        return (workload, binding_type, slo_class)
     return (stage.sub_agent, stage.tool_signature, slo_class)
 
 
@@ -421,6 +450,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--glob", default="/mnt/data/*.json", help="Glob for trace JSON files")
     ap.add_argument("--slo-class", default="interactive", choices=["interactive", "batch"], help="SLO class label")
+    ap.add_argument("--rg-version", default="legacy", choices=["legacy", "v2"],
+                    help="Resource-group key: legacy=(sub_agent,tool_signature,slo_class), "
+                         "v2=(workload_type,binding_type,slo_class)")
     ap.add_argument("--decode-tps", type=float, default=DEFAULT_DECODE_TPS)
     ap.add_argument("--prefill-tps", type=float, default=DEFAULT_PREFILL_TPS)
     ap.add_argument("--show-top", type=int, default=20, help="How many top groups/patterns to display")
@@ -488,7 +520,7 @@ def main():
             st.est_cost = estimate_cost(st, args.decode_tps, args.prefill_tps, tool_lat, token_count)
             ep_total += st.est_cost
 
-            rg = stage_rg_key(st, args.slo_class)
+            rg = stage_rg_key(st, args.slo_class, args.rg_version)
             rg_costs[rg].append(st.est_cost)
 
             # redundancy: repeated tool+args within RG + avoidable cost
